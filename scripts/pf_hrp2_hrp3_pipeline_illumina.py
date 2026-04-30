@@ -4,29 +4,27 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as cf
 import csv
-import gzip
 import json
 import logging
-import math
 import os
 import re
 import shutil
 import statistics
 import subprocess
 import sys
-import tempfile
 import traceback
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pysam
 
 
+AUTHOR = "Khadim Gueye"
+
 RESET = "\033[0m"
 BOLD = "\033[1m"
-DIM = "\033[2m"
 RED = "\033[31m"
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
@@ -98,6 +96,7 @@ class Config:
     sample_workers: int
     fastp_bin: str
     fastqc_bin: str
+    multiqc_bin: str
     bwa_bin: str
     samtools_bin: str
     bedtools_bin: str
@@ -142,6 +141,11 @@ def get_logger(name: str) -> logging.Logger:
     lg.setLevel(logging.INFO)
     lg.propagate = True
     return lg
+
+
+def shlex_q(p: Path | str) -> str:
+    s = str(p)
+    return "'" + s.replace("'", "'\"'\"'") + "'"
 
 
 def run_cmd(cmd: List[str], logger: logging.Logger, cwd: Optional[Path] = None, stdout_path: Optional[Path] = None) -> None:
@@ -206,13 +210,6 @@ def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 
-def safe_unlink(p: Path) -> None:
-    try:
-        p.unlink(missing_ok=True)
-    except Exception:
-        pass
-
-
 def file_nonempty(p: Path) -> bool:
     return p.exists() and p.stat().st_size > 0
 
@@ -250,8 +247,7 @@ def parse_bed(bed: Path) -> List[GeneRegion]:
 
 def normalize_gene_name(x: str) -> str:
     x2 = x.replace("|", "_").replace(" ", "_")
-    x2 = re.sub(r"[^A-Za-z0-9._-]+", "_", x2)
-    return x2
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", x2)
 
 
 def discover_pairs(input_dir: Path) -> List[SamplePair]:
@@ -261,10 +257,10 @@ def discover_pairs(input_dir: Path) -> List[SamplePair]:
     all_files = sorted(set(all_files))
     if not all_files:
         raise PipelineError(f"No FASTQ files found under: {input_dir}")
+
     r1_map: Dict[str, Path] = {}
     r2_map: Dict[str, Path] = {}
-
-    pats = [
+    patterns = [
         (re.compile(r"(.+?)(?:_R?1(?:_001)?)(\.f(?:ast)?q(?:\.gz)?)$", re.IGNORECASE), 1),
         (re.compile(r"(.+?)(?:_R?2(?:_001)?)(\.f(?:ast)?q(?:\.gz)?)$", re.IGNORECASE), 2),
         (re.compile(r"(.+?)(?:\.R1)(\.f(?:ast)?q(?:\.gz)?)$", re.IGNORECASE), 1),
@@ -274,37 +270,35 @@ def discover_pairs(input_dir: Path) -> List[SamplePair]:
     ]
 
     for fp in all_files:
-        name = fp.name
-        matched = False
-        for rx, mate in pats:
-            m = rx.match(name)
+        for rx, mate in patterns:
+            m = rx.match(fp.name)
             if m:
                 sample = m.group(1)
                 if mate == 1:
                     r1_map[sample] = fp
                 else:
                     r2_map[sample] = fp
-                matched = True
                 break
-        if not matched:
-            continue
 
     samples = sorted(set(r1_map) & set(r2_map))
     if not samples:
         raise PipelineError("No paired FASTQ files discovered.")
-    pairs = [SamplePair(sample=s, r1=r1_map[s], r2=r2_map[s]) for s in samples]
-    return pairs
+    return [SamplePair(sample=s, r1=r1_map[s], r2=r2_map[s]) for s in samples]
 
 
 def check_dependencies(cfg: Config) -> None:
-    which_or_raise(cfg.fastp_bin)
-    which_or_raise(cfg.fastqc_bin)
-    which_or_raise(cfg.bwa_bin)
-    which_or_raise(cfg.samtools_bin)
-    which_or_raise(cfg.bedtools_bin)
-    which_or_raise(cfg.bcftools_bin)
-    which_or_raise(cfg.bgzip_bin)
-    which_or_raise(cfg.tabix_bin)
+    for tool in [
+        cfg.fastp_bin,
+        cfg.fastqc_bin,
+        cfg.multiqc_bin,
+        cfg.bwa_bin,
+        cfg.samtools_bin,
+        cfg.bedtools_bin,
+        cfg.bcftools_bin,
+        cfg.bgzip_bin,
+        cfg.tabix_bin,
+    ]:
+        which_or_raise(tool)
     if not cfg.snpeff_jar.exists():
         raise PipelineError(f"snpEff jar not found: {cfg.snpeff_jar}")
 
@@ -316,6 +310,83 @@ def index_reference_bwa(ref: Path, bwa_bin: str, samtools_bin: str, logger: logg
     fai = Path(str(ref) + ".fai")
     if not fai.exists():
         run_cmd([samtools_bin, "faidx", str(ref)], logger)
+
+
+def fastqc_on_files(cfg: Config, files: List[Path], out_dir: Path, logger: logging.Logger) -> None:
+    ensure_dir(out_dir)
+    good_files = [x for x in files if file_nonempty(x)]
+    if not good_files:
+        logger.info("No non-empty files available for FastQC in %s", out_dir)
+        return
+    cmd = [cfg.fastqc_bin, "-t", str(max(1, min(cfg.threads, 4))), "-o", str(out_dir)] + [str(x) for x in good_files]
+    run_cmd(cmd, logger)
+
+
+def run_multiqc(cfg: Config, search_dir: Path, out_dir: Path, name: str, logger: logging.Logger) -> None:
+    ensure_dir(out_dir)
+    cmd = [
+        cfg.multiqc_bin,
+        str(search_dir),
+        "-o",
+        str(out_dir),
+        "-n",
+        name,
+        "--force",
+    ]
+    run_cmd(cmd, logger)
+
+
+def run_fastp(
+    cfg: Config,
+    r1: Path,
+    r2: Path,
+    out_r1: Path,
+    out_r2: Path,
+    html: Path,
+    json_out: Path,
+    logger: logging.Logger,
+) -> None:
+    ensure_dir(out_r1.parent)
+    cmd = [
+        cfg.fastp_bin,
+        "-i",
+        str(r1),
+        "-I",
+        str(r2),
+        "-o",
+        str(out_r1),
+        "-O",
+        str(out_r2),
+        "--thread",
+        str(max(1, cfg.threads)),
+        "--detect_adapter_for_pe",
+        "--length_required",
+        str(cfg.min_read_len),
+        "--json",
+        str(json_out),
+        "--html",
+        str(html),
+    ]
+    run_cmd(cmd, logger)
+
+
+def map_paired_bwa(cfg: Config, ref: Path, r1: Path, r2: Path, out_bam: Path, logger: logging.Logger) -> None:
+    ensure_dir(out_bam.parent)
+    bwa_threads = max(1, cfg.threads // 2)
+    sort_threads = max(1, cfg.threads // 2)
+    script = (
+        f"set -euo pipefail; "
+        f"{cfg.bwa_bin} mem -t {bwa_threads} {shlex_q(ref)} {shlex_q(r1)} {shlex_q(r2)} "
+        f"| {cfg.samtools_bin} sort -@ {sort_threads} -o {shlex_q(out_bam)} -"
+    )
+    run_bash(script, logger)
+    run_cmd([cfg.samtools_bin, "index", str(out_bam)], logger)
+
+
+def bam_stats(cfg: Config, bam: Path, flagstat_txt: Path, idxstats_txt: Path, stats_txt: Path, logger: logging.Logger) -> None:
+    run_cmd([cfg.samtools_bin, "flagstat", str(bam)], logger, stdout_path=flagstat_txt)
+    run_cmd([cfg.samtools_bin, "idxstats", str(bam)], logger, stdout_path=idxstats_txt)
+    run_cmd([cfg.samtools_bin, "stats", str(bam)], logger, stdout_path=stats_txt)
 
 
 def ensure_samtools_fastq_extract_nonhuman(
@@ -339,76 +410,24 @@ def ensure_samtools_fastq_extract_nonhuman(
     run_bash(script, logger)
 
 
-def shlex_q(p: Path | str) -> str:
-    s = str(p)
-    return "'" + s.replace("'", "'\"'\"'") + "'"
-
-
-def fastqc_on_files(cfg: Config, files: List[Path], out_dir: Path, logger: logging.Logger) -> None:
-    ensure_dir(out_dir)
-    cmd = [cfg.fastqc_bin, "-t", str(max(1, min(cfg.threads, 4))), "-o", str(out_dir)] + [str(x) for x in files]
-    run_cmd(cmd, logger)
-
-
-def run_fastp(cfg: Config, r1: Path, r2: Path, out_r1: Path, out_r2: Path, html: Path, json_out: Path, logger: logging.Logger) -> None:
-    ensure_dir(out_r1.parent)
-    cmd = [
-        cfg.fastp_bin,
-        "-i", str(r1),
-        "-I", str(r2),
-        "-o", str(out_r1),
-        "-O", str(out_r2),
-        "--thread", str(max(1, cfg.threads)),
-        "--detect_adapter_for_pe",
-        "--length_required", str(cfg.min_read_len),
-        "--json", str(json_out),
-        "--html", str(html),
-    ]
-    run_cmd(cmd, logger)
-
-
-def map_paired_bwa(cfg: Config, ref: Path, r1: Path, r2: Path, out_bam: Path, logger: logging.Logger) -> None:
-    ensure_dir(out_bam.parent)
-
-    bwa_threads = max(1, cfg.threads // 2)
-    sort_threads = max(1, cfg.threads // 2)
-
-    script = (
-        f"{cfg.bwa_bin} mem -t {bwa_threads} {shlex_q(ref)} {shlex_q(r1)} {shlex_q(r2)} "
-        f"| {cfg.samtools_bin} sort -@ {sort_threads} -o {shlex_q(out_bam)} -"
-    )
-    #print (script)
-    #run_bash(script, logger)
-    os.system(script)
-    run_cmd([cfg.samtools_bin, "index", str(out_bam)], logger)
-
-
-def bam_stats(cfg: Config, bam: Path, flagstat_txt: Path, idxstats_txt: Path, stats_txt: Path, logger: logging.Logger) -> None:
-    run_cmd([cfg.samtools_bin, "flagstat", str(bam)], logger, stdout_path=flagstat_txt)
-    run_cmd([cfg.samtools_bin, "idxstats", str(bam)], logger, stdout_path=idxstats_txt)
-    run_cmd([cfg.samtools_bin, "stats", str(bam)], logger, stdout_path=stats_txt)
-
-
 def depth_bed(cfg: Config, bam: Path, bed: Path, out_tsv: Path, logger: logging.Logger) -> None:
-    script = (
-        f"set -euo pipefail; "
-        f"{cfg.samtools_bin} depth -aa -b {shlex_q(bed)} {shlex_q(bam)} > {shlex_q(out_tsv)}"
-    )
+    script = f"set -euo pipefail; {cfg.samtools_bin} depth -aa -b {shlex_q(bed)} {shlex_q(bam)} > {shlex_q(out_tsv)}"
     run_bash(script, logger)
 
 
 def compute_gene_coverage(depth_tsv: Path, genes: List[GeneRegion], out_tsv: Path) -> List[Dict[str, object]]:
     per_gene_depths: Dict[str, List[int]] = {g.name: [] for g in genes}
     gene_by_key = {(g.chrom, pos): g.name for g in genes for pos in range(g.start1, g.end + 1)}
+
     with open(depth_tsv, "r") as fh:
         for line in fh:
             if not line.strip():
                 continue
             chrom, pos, dep = line.rstrip("\n").split("\t")
-            key = (chrom, int(pos))
-            gname = gene_by_key.get(key)
+            gname = gene_by_key.get((chrom, int(pos)))
             if gname is not None:
                 per_gene_depths[gname].append(int(dep))
+
     rows: List[Dict[str, object]] = []
     for g in genes:
         vals = per_gene_depths[g.name]
@@ -421,19 +440,22 @@ def compute_gene_coverage(depth_tsv: Path, genes: List[GeneRegion], out_tsv: Pat
         breadth1 = (sum(1 for x in vals if x >= 1) / length * 100.0) if length > 0 else 0.0
         breadth5 = (sum(1 for x in vals if x >= 5) / length * 100.0) if length > 0 else 0.0
         breadth10 = (sum(1 for x in vals if x >= 10) / length * 100.0) if length > 0 else 0.0
-        rows.append({
-            "gene": g.name,
-            "chrom": g.chrom,
-            "start_1based": g.start1,
-            "end_1based": g.end,
-            "length_bp": length,
-            "mean_depth": round(mean_dp, 4),
-            "median_depth": round(float(med_dp), 4),
-            "max_depth": int(max_dp),
-            "breadth_1x_pct": round(breadth1, 4),
-            "breadth_5x_pct": round(breadth5, 4),
-            "breadth_10x_pct": round(breadth10, 4),
-        })
+        rows.append(
+            {
+                "gene": g.name,
+                "chrom": g.chrom,
+                "start_1based": g.start1,
+                "end_1based": g.end,
+                "length_bp": length,
+                "mean_depth": round(mean_dp, 4),
+                "median_depth": round(float(med_dp), 4),
+                "max_depth": int(max_dp),
+                "breadth_1x_pct": round(breadth1, 4),
+                "breadth_5x_pct": round(breadth5, 4),
+                "breadth_10x_pct": round(breadth10, 4),
+            }
+        )
+
     with open(out_tsv, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()), delimiter="\t")
         w.writeheader()
@@ -445,26 +467,29 @@ def gene_presence_calls(rows: List[Dict[str, object]], cfg: Config, out_tsv: Pat
     out_rows: List[Dict[str, object]] = []
     for r in rows:
         present = (
-            float(r["mean_depth"]) >= cfg.gene_presence_min_mean_depth and
-            float(r["breadth_1x_pct"]) >= cfg.gene_presence_min_breadth_1x and
-            float(r["breadth_5x_pct"]) >= cfg.gene_presence_min_breadth_5x and
-            float(r["breadth_10x_pct"]) >= cfg.gene_presence_min_breadth_10x
+            float(r["mean_depth"]) >= cfg.gene_presence_min_mean_depth
+            and float(r["breadth_1x_pct"]) >= cfg.gene_presence_min_breadth_1x
+            and float(r["breadth_5x_pct"]) >= cfg.gene_presence_min_breadth_5x
+            and float(r["breadth_10x_pct"]) >= cfg.gene_presence_min_breadth_10x
         )
-        out_rows.append({
-            "sample": sample,
-            "gene": r["gene"],
-            "chrom": r["chrom"],
-            "start_1based": r["start_1based"],
-            "end_1based": r["end_1based"],
-            "length_bp": r["length_bp"],
-            "mean_depth": r["mean_depth"],
-            "median_depth": r["median_depth"],
-            "max_depth": r["max_depth"],
-            "breadth_1x_pct": r["breadth_1x_pct"],
-            "breadth_5x_pct": r["breadth_5x_pct"],
-            "breadth_10x_pct": r["breadth_10x_pct"],
-            "gene_status": "present" if present else "deleted_or_not_detected",
-        })
+        out_rows.append(
+            {
+                "sample": sample,
+                "gene": r["gene"],
+                "chrom": r["chrom"],
+                "start_1based": r["start_1based"],
+                "end_1based": r["end_1based"],
+                "length_bp": r["length_bp"],
+                "mean_depth": r["mean_depth"],
+                "median_depth": r["median_depth"],
+                "max_depth": r["max_depth"],
+                "breadth_1x_pct": r["breadth_1x_pct"],
+                "breadth_5x_pct": r["breadth_5x_pct"],
+                "breadth_10x_pct": r["breadth_10x_pct"],
+                "gene_status": "present" if present else "deleted_or_not_detected",
+            }
+        )
+
     with open(out_tsv, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=list(out_rows[0].keys()), delimiter="\t")
         w.writeheader()
@@ -477,8 +502,7 @@ def call_variants(cfg: Config, bam: Path, vcf_gz: Path, logger: logging.Logger) 
     script = (
         f"set -euo pipefail; "
         f"{cfg.bcftools_bin} mpileup -Ou -f {shlex_q(cfg.pf_ref)} "
-        f"-q {cfg.min_mapq} -Q {cfg.min_base_qual} "
-        f"{shlex_q(bam)} "
+        f"-q {cfg.min_mapq} -Q {cfg.min_base_qual} {shlex_q(bam)} "
         f"| {cfg.bcftools_bin} call -mv -Ou "
         f"| {cfg.bcftools_bin} filter -Oz "
         f"-i 'QUAL>={cfg.variant_min_qual} && INFO/DP>={cfg.variant_min_dp}' "
@@ -490,17 +514,12 @@ def call_variants(cfg: Config, bam: Path, vcf_gz: Path, logger: logging.Logger) 
 
 def snpeff_annotate(cfg: Config, vcf_in: Path, vcf_out: Path, logger: logging.Logger) -> None:
     ensure_dir(vcf_out.parent)
-    base = [
-        "java",
-        "-Xmx8g",
-        "-jar",
-        str(cfg.snpeff_jar),
-    ]
+    base = ["java", "-Xmx8g", "-jar", str(cfg.snpeff_jar)]
     if cfg.snpeff_config:
         base += ["-c", str(cfg.snpeff_config)]
     base += [cfg.snpeff_db, str(vcf_in)]
     script = (
-        f"set -euo pipefail; "
+        "set -euo pipefail; "
         + " ".join(shlex_q(x) if i >= 3 else x for i, x in enumerate(base))
         + f" | {cfg.bgzip_bin} -c > {shlex_q(vcf_out)}"
     )
@@ -514,7 +533,7 @@ def parse_fastp_json(p: Path) -> Dict[str, object]:
 
 
 def safe_num(d: Dict[str, object], *keys: str) -> Optional[object]:
-    cur = d
+    cur: object = d
     for k in keys:
         if not isinstance(cur, dict) or k not in cur:
             return None
@@ -524,7 +543,7 @@ def safe_num(d: Dict[str, object], *keys: str) -> Optional[object]:
 
 def summarize_qc(sample: str, fastp_json: Path, out_tsv: Path) -> Dict[str, object]:
     data = parse_fastp_json(fastp_json)
-    rows = {
+    row = {
         "sample": sample,
         "raw_total_reads": safe_num(data, "summary", "before_filtering", "total_reads"),
         "raw_total_bases": safe_num(data, "summary", "before_filtering", "total_bases"),
@@ -543,10 +562,10 @@ def summarize_qc(sample: str, fastp_json: Path, out_tsv: Path) -> Dict[str, obje
         "reads_with_too_long_polyX": safe_num(data, "filtering_result", "too_long_polyx_reads"),
     }
     with open(out_tsv, "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=list(rows.keys()), delimiter="\t")
+        w = csv.DictWriter(fh, fieldnames=list(row.keys()), delimiter="\t")
         w.writeheader()
-        w.writerow(rows)
-    return rows
+        w.writerow(row)
+    return row
 
 
 def count_primary_reads_in_bam(bam: Path) -> int:
@@ -594,60 +613,46 @@ def extract_gene_haplotypes(
     out_rows: List[Dict[str, object]] = []
     if not snps:
         with open(out_reads_tsv, "w", newline="") as fh:
-            w = csv.writer(fh, delimiter="\t")
-            w.writerow(["sample", "gene", "read_name", "haplotype_string", "informative_sites"])
+            csv.writer(fh, delimiter="\t").writerow(["sample", "gene", "read_name", "haplotype_string", "informative_sites"])
         with open(out_haps_tsv, "w", newline="") as fh:
-            w = csv.writer(fh, delimiter="\t")
-            w.writerow(["sample", "gene", "haplotype_id", "haplotype_string", "supporting_reads", "frequency", "informative_sites"])
-        with open(out_fasta, "w") as fh:
-            pass
+            csv.writer(fh, delimiter="\t").writerow(
+                ["sample", "gene", "haplotype_id", "haplotype_string", "supporting_reads", "frequency", "informative_sites"]
+            )
+        out_fasta.write_text("")
         return out_rows
 
-    snp_index = {(chrom, pos): idx for idx, (chrom, pos, ref, alt, ann) in enumerate(snps)}
-    ref_alt = {(chrom, pos): (ref, alt) for chrom, pos, ref, alt, ann in snps}
+    snp_index = {(chrom, pos): idx for idx, (chrom, pos, _ref, _alt, _ann) in enumerate(snps)}
+    ref_alt = {(chrom, pos): (ref, alt) for chrom, pos, ref, alt, _ann in snps}
     read_calls: Dict[str, List[str]] = {}
-    read_info_count: Dict[str, int] = defaultdict(int)
 
     with pysam.AlignmentFile(str(bam_path), "rb") as bam:
         for aln in bam.fetch(region.chrom, region.start0, region.end):
             if aln.is_unmapped or aln.is_secondary or aln.is_supplementary or aln.is_duplicate:
                 continue
-            if aln.mapping_quality < cfg.hap_min_mapq:
-                continue
-            if aln.query_sequence is None:
+            if aln.mapping_quality < cfg.hap_min_mapq or aln.query_sequence is None:
                 continue
             qname = aln.query_name
-            if qname not in read_calls:
-                read_calls[qname] = ["N"] * len(snps)
-            pairs = aln.get_aligned_pairs(matches_only=False)
+            read_calls.setdefault(qname, ["N"] * len(snps))
             seq = aln.query_sequence.upper()
             quals = aln.query_qualities or []
-            for qpos, rpos in pairs:
+            for qpos, rpos in aln.get_aligned_pairs(matches_only=False):
                 if qpos is None or rpos is None:
                     continue
                 key = (region.chrom, rpos + 1)
                 idx = snp_index.get(key)
-                if idx is None:
+                if idx is None or qpos >= len(seq) or qpos >= len(quals):
                     continue
-                if qpos >= len(seq):
-                    continue
-                if qpos >= len(quals):
+                if int(quals[qpos]) < cfg.hap_min_baseq:
                     continue
                 b = seq[qpos]
-                q = int(quals[qpos])
-                if q < cfg.hap_min_baseq:
-                    continue
                 ref, alt = ref_alt[key]
                 if b == ref or b == alt:
-                    if read_calls[qname][idx] == "N":
-                        read_info_count[qname] += 1
                     read_calls[qname][idx] = b
 
+    filtered_haps: List[str] = []
     with open(out_reads_tsv, "w", newline="") as fh:
         w = csv.writer(fh, delimiter="\t")
         w.writerow(["sample", "gene", "read_name", "haplotype_string", "informative_sites"])
-
-        filtered_haps: List[str] = []
         for qname, hap in read_calls.items():
             h = "".join(hap)
             ninfo = sum(1 for x in hap if x != "N")
@@ -681,8 +686,7 @@ def extract_gene_haplotypes(
             }
             out_rows.append(row)
             w.writerow(row)
-            fa.write(f">{sample}|{gene_name}|{hid}|reads={cnt}|freq={freq:.6f}|informative={ninfo}\n")
-            fa.write(hap + "\n")
+            fa.write(f">{sample}|{gene_name}|{hid}|reads={cnt}|freq={freq:.6f}|informative={ninfo}\n{hap}\n")
 
     return out_rows
 
@@ -697,10 +701,10 @@ def aggregate_sample_gene_calls(sample_call_files: List[Path], out_tsv: Path, ou
     rows: List[Dict[str, str]] = []
     for fp in sample_call_files:
         with open(fp, "r") as fh:
-            dr = csv.DictReader(fh, delimiter="\t")
-            rows.extend(list(dr))
+            rows.extend(list(csv.DictReader(fh, delimiter="\t")))
     if not rows:
         return
+
     with open(out_tsv, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()), delimiter="\t")
         w.writeheader()
@@ -715,14 +719,17 @@ def aggregate_sample_gene_calls(sample_call_files: List[Path], out_tsv: Path, ou
         n = len(vals)
         present = sum(1 for x in vals if x["gene_status"] == "present")
         deleted = n - present
-        prev_rows.append({
-            "gene": gene,
-            "n_samples": n,
-            "n_present": present,
-            "n_deleted_or_not_detected": deleted,
-            "prevalence_present_pct": round((present / n * 100.0) if n > 0 else 0.0, 4),
-            "prevalence_deleted_or_not_detected_pct": round((deleted / n * 100.0) if n > 0 else 0.0, 4),
-        })
+        prev_rows.append(
+            {
+                "gene": gene,
+                "n_samples": n,
+                "n_present": present,
+                "n_deleted_or_not_detected": deleted,
+                "prevalence_present_pct": round((present / n * 100.0) if n > 0 else 0.0, 4),
+                "prevalence_deleted_or_not_detected_pct": round((deleted / n * 100.0) if n > 0 else 0.0, 4),
+            }
+        )
+
     with open(out_prev_tsv, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=list(prev_rows[0].keys()), delimiter="\t")
         w.writeheader()
@@ -733,10 +740,10 @@ def aggregate_qc(sample_qc_files: List[Path], out_tsv: Path) -> None:
     rows: List[Dict[str, str]] = []
     for fp in sample_qc_files:
         with open(fp, "r") as fh:
-            dr = csv.DictReader(fh, delimiter="\t")
-            rows.extend(list(dr))
+            rows.extend(list(csv.DictReader(fh, delimiter="\t")))
     if not rows:
         return
+
     with open(out_tsv, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()), delimiter="\t")
         w.writeheader()
@@ -749,15 +756,17 @@ def aggregate_haplotypes(sample_hap_files: List[Path], out_tsv: Path, out_prev_t
         if not fp.exists():
             continue
         with open(fp, "r") as fh:
-            dr = csv.DictReader(fh, delimiter="\t")
-            rows.extend(list(dr))
+            rows.extend(list(csv.DictReader(fh, delimiter="\t")))
+
     if not rows:
         with open(out_tsv, "w", newline="") as fh:
-            w = csv.writer(fh, delimiter="\t")
-            w.writerow(["sample", "gene", "haplotype_id", "haplotype_string", "supporting_reads", "frequency", "informative_sites"])
+            csv.writer(fh, delimiter="\t").writerow(
+                ["sample", "gene", "haplotype_id", "haplotype_string", "supporting_reads", "frequency", "informative_sites"]
+            )
         with open(out_prev_tsv, "w", newline="") as fh:
-            w = csv.writer(fh, delimiter="\t")
-            w.writerow(["gene", "haplotype_string", "n_samples", "total_supporting_reads", "sample_prevalence_pct", "read_weighted_fraction_within_gene_pct"])
+            csv.writer(fh, delimiter="\t").writerow(
+                ["gene", "haplotype_string", "n_samples", "total_supporting_reads", "sample_prevalence_pct", "read_weighted_fraction_within_gene_pct"]
+            )
         return
 
     with open(out_tsv, "w", newline="") as fh:
@@ -772,34 +781,34 @@ def aggregate_haplotypes(sample_hap_files: List[Path], out_tsv: Path, out_prev_t
     for r in rows:
         gene = r["gene"]
         hap = r["haplotype_string"]
-        samp = r["sample"]
+        sample = r["sample"]
         support = int(float(r["supporting_reads"]))
         total_reads_by_gene[gene] += support
-        samples_by_gene[gene].add(samp)
-        key = (gene, hap)
-        if key not in grouped:
-            grouped[key] = {
-                "gene": gene,
-                "haplotype_string": hap,
-                "samples": set(),
-                "total_supporting_reads": 0,
-            }
-        grouped[key]["samples"].add(samp)
-        grouped[key]["total_supporting_reads"] += support
+        samples_by_gene[gene].add(sample)
+        grouped.setdefault(
+            (gene, hap),
+            {"gene": gene, "haplotype_string": hap, "samples": set(), "total_supporting_reads": 0},
+        )
+        grouped[(gene, hap)]["samples"].add(sample)
+        grouped[(gene, hap)]["total_supporting_reads"] += support
 
     prev_rows = []
     for (gene, hap), d in sorted(grouped.items()):
         n_gene_samples = len(samples_by_gene[gene])
         n_hap_samples = len(d["samples"])
         total_gene_reads = total_reads_by_gene[gene]
-        prev_rows.append({
-            "gene": gene,
-            "haplotype_string": hap,
-            "n_samples": n_hap_samples,
-            "total_supporting_reads": d["total_supporting_reads"],
-            "sample_prevalence_pct": round((n_hap_samples / n_gene_samples * 100.0) if n_gene_samples > 0 else 0.0, 4),
-            "read_weighted_fraction_within_gene_pct": round((d["total_supporting_reads"] / total_gene_reads * 100.0) if total_gene_reads > 0 else 0.0, 4),
-        })
+        prev_rows.append(
+            {
+                "gene": gene,
+                "haplotype_string": hap,
+                "n_samples": n_hap_samples,
+                "total_supporting_reads": d["total_supporting_reads"],
+                "sample_prevalence_pct": round((n_hap_samples / n_gene_samples * 100.0) if n_gene_samples > 0 else 0.0, 4),
+                "read_weighted_fraction_within_gene_pct": round(
+                    (d["total_supporting_reads"] / total_gene_reads * 100.0) if total_gene_reads > 0 else 0.0, 4
+                ),
+            }
+        )
 
     with open(out_prev_tsv, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=list(prev_rows[0].keys()), delimiter="\t")
@@ -813,10 +822,10 @@ def aggregate_variant_counts(sample_variant_files: List[Path], out_tsv: Path) ->
         if not fp.exists():
             continue
         with open(fp, "r") as fh:
-            dr = csv.DictReader(fh, delimiter="\t")
-            rows.extend(list(dr))
+            rows.extend(list(csv.DictReader(fh, delimiter="\t")))
     if not rows:
         return
+
     with open(out_tsv, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()), delimiter="\t")
         w.writeheader()
@@ -838,21 +847,24 @@ def write_region_variant_table(sample: str, vcf_gz: Path, genes: List[GeneRegion
                 except Exception:
                     ann = ""
                 for alt in rec.alts:
-                    rows.append({
-                        "sample": sample,
-                        "gene": g.name,
-                        "chrom": rec.contig,
-                        "pos": int(rec.pos),
-                        "ref": str(rec.ref),
-                        "alt": str(alt),
-                        "qual": "." if rec.qual is None else rec.qual,
-                        "annotation": ann,
-                    })
+                    rows.append(
+                        {
+                            "sample": sample,
+                            "gene": g.name,
+                            "chrom": rec.contig,
+                            "pos": int(rec.pos),
+                            "ref": str(rec.ref),
+                            "alt": str(alt),
+                            "qual": "." if rec.qual is None else rec.qual,
+                            "annotation": ann,
+                        }
+                    )
+
     if not rows:
         with open(out_tsv, "w", newline="") as fh:
-            w = csv.writer(fh, delimiter="\t")
-            w.writerow(["sample", "gene", "chrom", "pos", "ref", "alt", "qual", "annotation"])
+            csv.writer(fh, delimiter="\t").writerow(["sample", "gene", "chrom", "pos", "ref", "alt", "qual", "annotation"])
         return
+
     with open(out_tsv, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()), delimiter="\t")
         w.writeheader()
@@ -863,21 +875,24 @@ def process_sample(cfg: Config, sample_pair: SamplePair, genes: List[GeneRegion]
     sample = sample_pair.sample
     logger = get_logger(sample)
     sample_dir = cfg.output_dir / "samples" / sample
+
     raw_qc_dir = sample_dir / "qc_raw"
-    clean_qc_dir = sample_dir / "qc_clean"
     trim_dir = sample_dir / "trimmed"
+    trim_qc_dir = sample_dir / "qc_after_trimming"
     host_dir = sample_dir / "host_depletion"
+    host_qc_dir = sample_dir / "qc_after_host_removal"
     pf_dir = sample_dir / "pf_mapping"
     cov_dir = sample_dir / "coverage"
     var_dir = sample_dir / "variants"
     hap_dir = sample_dir / "haplotypes"
     sum_dir = sample_dir / "summary"
     tmp_dir = sample_dir / "tmp"
+    multiqc_dir = sample_dir / "multiqc"
 
-    for d in [raw_qc_dir, clean_qc_dir, trim_dir, host_dir, pf_dir, cov_dir, var_dir, hap_dir, sum_dir, tmp_dir]:
+    for d in [raw_qc_dir, trim_dir, trim_qc_dir, host_dir, host_qc_dir, pf_dir, cov_dir, var_dir, hap_dir, sum_dir, tmp_dir, multiqc_dir]:
         ensure_dir(d)
 
-    print(step(f"{sample} :: QC raw"))
+    print(step(f"{sample} :: FastQC before trimming"))
     fastqc_on_files(cfg, [sample_pair.r1, sample_pair.r2], raw_qc_dir, logger)
 
     trim_r1 = trim_dir / f"{sample}.trimmed.R1.fastq.gz"
@@ -885,11 +900,11 @@ def process_sample(cfg: Config, sample_pair: SamplePair, genes: List[GeneRegion]
     fastp_html = trim_dir / f"{sample}.fastp.html"
     fastp_json = trim_dir / f"{sample}.fastp.json"
 
-    print(step(f"{sample} :: Trim/filter"))
+    print(step(f"{sample} :: Adapter and quality trimming"))
     run_fastp(cfg, sample_pair.r1, sample_pair.r2, trim_r1, trim_r2, fastp_html, fastp_json, logger)
 
-    print(step(f"{sample} :: QC clean"))
-    fastqc_on_files(cfg, [trim_r1, trim_r2], clean_qc_dir, logger)
+    print(step(f"{sample} :: FastQC after trimming"))
+    fastqc_on_files(cfg, [trim_r1, trim_r2], trim_qc_dir, logger)
 
     human_bam = host_dir / f"{sample}.human.bam"
     human_flagstat = host_dir / f"{sample}.human.flagstat.txt"
@@ -899,17 +914,20 @@ def process_sample(cfg: Config, sample_pair: SamplePair, genes: List[GeneRegion]
     nonhuman_r2 = host_dir / f"{sample}.nonhuman.R2.fastq"
     nonhuman_single = host_dir / f"{sample}.nonhuman.singletons.fastq"
 
-    print(step(f"{sample} :: Human decontamination"))
+    print(step(f"{sample} :: Human read removal"))
     map_paired_bwa(cfg, cfg.human_ref, trim_r1, trim_r2, human_bam, logger)
     bam_stats(cfg, human_bam, human_flagstat, human_idxstats, human_stats, logger)
     ensure_samtools_fastq_extract_nonhuman(cfg.samtools_bin, human_bam, nonhuman_r1, nonhuman_r2, nonhuman_single, logger)
+
+    print(step(f"{sample} :: FastQC after human read removal"))
+    fastqc_on_files(cfg, [nonhuman_r1, nonhuman_r2, nonhuman_single], host_qc_dir, logger)
 
     pf_bam = pf_dir / f"{sample}.Pf3D7.bam"
     pf_flagstat = pf_dir / f"{sample}.Pf3D7.flagstat.txt"
     pf_idxstats = pf_dir / f"{sample}.Pf3D7.idxstats.txt"
     pf_stats = pf_dir / f"{sample}.Pf3D7.stats.txt"
 
-    print(step(f"{sample} :: Map to Pf3D7"))
+    print(step(f"{sample} :: Mapping to Pf3D7"))
     map_paired_bwa(cfg, cfg.pf_ref, nonhuman_r1, nonhuman_r2, pf_bam, logger)
     bam_stats(cfg, pf_bam, pf_flagstat, pf_idxstats, pf_stats, logger)
 
@@ -932,6 +950,7 @@ def process_sample(cfg: Config, sample_pair: SamplePair, genes: List[GeneRegion]
     print(step(f"{sample} :: Haplotype extraction"))
     all_hap_rows: List[Dict[str, object]] = []
     hap_summary_rows: List[Dict[str, object]] = []
+
     for g in genes:
         gsafe = normalize_gene_name(g.name)
         gene_reads_tsv = hap_dir / f"{sample}.{gsafe}.read_haplotypes.tsv"
@@ -951,14 +970,16 @@ def process_sample(cfg: Config, sample_pair: SamplePair, genes: List[GeneRegion]
         )
         all_hap_rows.extend(hap_rows)
         status = next((x["gene_status"] for x in call_rows if x["gene"] == g.name), "deleted_or_not_detected")
-        hap_summary_rows.append({
-            "sample": sample,
-            "gene": g.name,
-            "gene_status": status,
-            "n_gene_variants": len(snps),
-            "n_haplotypes_retained": len(hap_rows),
-            "total_haplotype_supporting_reads": sum(int(x["supporting_reads"]) for x in hap_rows) if hap_rows else 0,
-        })
+        hap_summary_rows.append(
+            {
+                "sample": sample,
+                "gene": g.name,
+                "gene_status": status,
+                "n_gene_variants": len(snps),
+                "n_haplotypes_retained": len(hap_rows),
+                "total_haplotype_supporting_reads": sum(int(x["supporting_reads"]) for x in hap_rows) if hap_rows else 0,
+            }
+        )
 
     sample_haps_tsv = hap_dir / f"{sample}.all_genes.haplotypes.tsv"
     if all_hap_rows:
@@ -968,8 +989,9 @@ def process_sample(cfg: Config, sample_pair: SamplePair, genes: List[GeneRegion]
             w.writerows(all_hap_rows)
     else:
         with open(sample_haps_tsv, "w", newline="") as fh:
-            w = csv.writer(fh, delimiter="\t")
-            w.writerow(["sample", "gene", "haplotype_id", "haplotype_string", "supporting_reads", "frequency", "informative_sites"])
+            csv.writer(fh, delimiter="\t").writerow(
+                ["sample", "gene", "haplotype_id", "haplotype_string", "supporting_reads", "frequency", "informative_sites"]
+            )
 
     hap_summary_tsv = hap_dir / f"{sample}.haplotype_summary.tsv"
     with open(hap_summary_tsv, "w", newline="") as fh:
@@ -977,39 +999,50 @@ def process_sample(cfg: Config, sample_pair: SamplePair, genes: List[GeneRegion]
         w.writeheader()
         w.writerows(hap_summary_rows)
 
+    print(step(f"{sample} :: MultiQC sample report"))
+    run_multiqc(cfg, sample_dir, multiqc_dir, f"{sample}.multiqc_report.html", logger)
+
     print(step(f"{sample} :: Summaries"))
     qc_summary_tsv = sum_dir / f"{sample}.qc_summary.tsv"
     qc_summary = summarize_qc(sample, fastp_json, qc_summary_tsv)
-
     pf_primary = count_primary_reads_in_bam(pf_bam)
     human_primary = count_primary_reads_in_bam(human_bam)
+
     sample_json = sum_dir / f"{sample}.summary.json"
-    write_json({
-        "sample": sample,
-        "inputs": {"r1": str(sample_pair.r1), "r2": str(sample_pair.r2)},
-        "files": {
-            "trimmed_r1": str(trim_r1),
-            "trimmed_r2": str(trim_r2),
-            "nonhuman_r1": str(nonhuman_r1),
-            "nonhuman_r2": str(nonhuman_r2),
-            "human_bam": str(human_bam),
-            "pf_bam": str(pf_bam),
-            "gene_calls_tsv": str(gene_calls_tsv),
-            "gene_coverage_tsv": str(gene_cov_tsv),
-            "region_variants_tsv": str(region_variants_tsv),
-            "annotated_vcf": str(anno_vcf),
-            "sample_haplotypes_tsv": str(sample_haps_tsv),
-            "sample_haplotype_summary_tsv": str(hap_summary_tsv),
-            "qc_summary_tsv": str(qc_summary_tsv),
+    write_json(
+        {
+            "author": AUTHOR,
+            "sample": sample,
+            "inputs": {"r1": str(sample_pair.r1), "r2": str(sample_pair.r2)},
+            "files": {
+                "raw_qc_dir": str(raw_qc_dir),
+                "trimmed_r1": str(trim_r1),
+                "trimmed_r2": str(trim_r2),
+                "trim_qc_dir": str(trim_qc_dir),
+                "nonhuman_r1": str(nonhuman_r1),
+                "nonhuman_r2": str(nonhuman_r2),
+                "host_removed_qc_dir": str(host_qc_dir),
+                "human_bam": str(human_bam),
+                "pf_bam": str(pf_bam),
+                "gene_calls_tsv": str(gene_calls_tsv),
+                "gene_coverage_tsv": str(gene_cov_tsv),
+                "region_variants_tsv": str(region_variants_tsv),
+                "annotated_vcf": str(anno_vcf),
+                "sample_haplotypes_tsv": str(sample_haps_tsv),
+                "sample_haplotype_summary_tsv": str(hap_summary_tsv),
+                "qc_summary_tsv": str(qc_summary_tsv),
+                "multiqc_report": str(multiqc_dir / f"{sample}.multiqc_report.html"),
+            },
+            "counts": {
+                "human_primary_alignments": human_primary,
+                "pf_primary_alignments": pf_primary,
+            },
+            "qc": qc_summary,
+            "gene_calls": call_rows,
+            "haplotype_summary": hap_summary_rows,
         },
-        "counts": {
-            "human_primary_alignments": human_primary,
-            "pf_primary_alignments": pf_primary,
-        },
-        "qc": qc_summary,
-        "gene_calls": call_rows,
-        "haplotype_summary": hap_summary_rows,
-    }, sample_json)
+        sample_json,
+    )
 
     if not cfg.keep_tmp:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -1031,6 +1064,7 @@ def build_output_layout(root: Path) -> None:
         root / "cohort" / "haplotypes",
         root / "cohort" / "qc",
         root / "cohort" / "variants",
+        root / "cohort" / "multiqc",
         root / "logs",
     ]:
         ensure_dir(p)
@@ -1045,7 +1079,7 @@ def validate_bed_against_reference(genes: List[GeneRegion], fai_dict: Dict[str, 
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description="PF HRP2/HRP3 Illumina deletion pipeline with staged QC and MultiQC.")
     p.add_argument("--input_dir", required=True, type=Path)
     p.add_argument("--output_dir", required=True, type=Path)
     p.add_argument("--pf_ref", required=True, type=Path)
@@ -1055,6 +1089,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sample_workers", type=int, default=2)
     p.add_argument("--fastp_bin", default="fastp")
     p.add_argument("--fastqc_bin", default="fastqc")
+    p.add_argument("--multiqc_bin", default="multiqc")
     p.add_argument("--bwa_bin", default="bwa")
     p.add_argument("--samtools_bin", default="samtools")
     p.add_argument("--bedtools_bin", default="bedtools")
@@ -1086,6 +1121,7 @@ def parse_args() -> argparse.Namespace:
 def banner(cfg: Config, n_samples: int) -> None:
     print(f"{MAGENTA}{BOLD}======================================================================{RESET}")
     print(f"{MAGENTA}{BOLD} PF-HRP2/HRP3 Illumina Pipeline{RESET}")
+    print(f"{MAGENTA}{BOLD} Author: {AUTHOR}{RESET}")
     print(f"{MAGENTA}{BOLD}======================================================================{RESET}")
     print(info(f"Input directory        : {cfg.input_dir}"))
     print(info(f"Output directory       : {cfg.output_dir}"))
@@ -1096,6 +1132,8 @@ def banner(cfg: Config, n_samples: int) -> None:
     print(info(f"Threads                : {cfg.threads}"))
     print(info(f"Sample workers         : {cfg.sample_workers}"))
     print(info(f"Samples detected       : {n_samples}"))
+    print(info("QC stages              : raw, after trimming, after human read removal"))
+    print(info("MultiQC                : per sample and final cohort report"))
     print(f"{MAGENTA}{BOLD}======================================================================{RESET}")
 
 
@@ -1111,6 +1149,7 @@ def main() -> int:
         sample_workers=args.sample_workers,
         fastp_bin=args.fastp_bin,
         fastqc_bin=args.fastqc_bin,
+        multiqc_bin=args.multiqc_bin,
         bwa_bin=args.bwa_bin,
         samtools_bin=args.samtools_bin,
         bedtools_bin=args.bedtools_bin,
@@ -1139,7 +1178,7 @@ def main() -> int:
     )
 
     build_output_layout(cfg.output_dir)
-    root_logger = setup_logger(cfg.output_dir / "logs" / cfg.log_file.name)
+    setup_logger(cfg.output_dir / "logs" / cfg.log_file.name)
     logger = get_logger("main")
 
     try:
@@ -1184,10 +1223,7 @@ def main() -> int:
         )
 
         print(step("Cohort :: aggregate QC"))
-        aggregate_qc(
-            qc_files,
-            cfg.output_dir / "cohort" / "qc" / "all_samples.qc_summary.tsv",
-        )
+        aggregate_qc(qc_files, cfg.output_dir / "cohort" / "qc" / "all_samples.qc_summary.tsv")
 
         print(step("Cohort :: aggregate haplotypes"))
         aggregate_haplotypes(
@@ -1197,18 +1233,27 @@ def main() -> int:
         )
 
         print(step("Cohort :: aggregate gene-region variants"))
-        aggregate_variant_counts(
-            var_files,
-            cfg.output_dir / "cohort" / "variants" / "all_samples.hrp2_hrp3.variants.tsv",
+        aggregate_variant_counts(var_files, cfg.output_dir / "cohort" / "variants" / "all_samples.hrp2_hrp3.variants.tsv")
+
+        print(step("Cohort :: final MultiQC report"))
+        run_multiqc(
+            cfg,
+            cfg.output_dir,
+            cfg.output_dir / "cohort" / "multiqc",
+            "cohort.multiqc_report.html",
+            logger,
         )
 
         cohort_summary = {
+            "author": AUTHOR,
             "n_samples_detected": len(pairs),
             "n_samples_completed": len(results),
             "genes_bed": str(cfg.genes_bed),
             "pf_ref": str(cfg.pf_ref),
             "human_ref": str(cfg.human_ref),
             "snpeff_db": cfg.snpeff_db,
+            "qc_stages": ["raw", "after_trimming", "after_human_read_removal"],
+            "multiqc_report": str(cfg.output_dir / "cohort" / "multiqc" / "cohort.multiqc_report.html"),
         }
         write_json(cohort_summary, cfg.output_dir / "cohort" / "cohort_summary.json")
 

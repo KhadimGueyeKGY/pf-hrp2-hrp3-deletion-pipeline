@@ -1,54 +1,12 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
 ###############################################################################
 # Project: pf-hrp2-hrp3-deletion-pipeline
 # Script:  main.sh
-# Author:  Khadim IGH / ACEGID
-# Date:    2026-04-22
-# Purpose: Run complete Illumina pipeline for HRP2/HRP3 deletion detection
-#          - QC (before/after)
-#          - Human decontamination
-#          - Mapping to Pf3D7
-#          - Variant calling + annotation (snpEff)
-#          - Gene coverage + deletion detection
-#          - Haplotype extraction
-#          - Cohort-level prevalence
+# Author:  Khadim Gueye / ACEGID
+# Purpose: Run HRP2/HRP3 deletion pipeline for Illumina or Nanopore data
 ###############################################################################
-
-set -euo pipefail
-
-############################################
-# CONFIGURATION
-############################################
-
-# Input FASTQ directory (auto-detects fq/fastq(.gz))
-INPUT_DIR="/mnt/hpc_acegid/home/khadmig/work/data/malaria/ILLUMINA_DATA/260420_VH00635_5_AAHL3MNM5/fastq"
-
-# Output directory
-OUTPUT_DIR="/mnt/hpc_acegid/home/khadmig/work/pf-hrp2-hrp3-deletion-pipeline/results"
-
-# References
-PF_REF="/mnt/hpc_acegid/home/khadmig/work/ref_3d7/Pf3D7_v2.fasta"
-HUMAN_REF="/mnt/hpc_acegid/nfsscratch/DATABASE/hg38/hg38.fa"   
-
-# Target genes (HRP2 / HRP3 BED)
-GENES_BED="assets/hrp2_hrp3_genes.bed"
-
-# snpEff configuration
-SNPEFF_JAR="/mnt/hpc_acegid/home/khadmig/miniconda/envs/pf_ont_pipeline/share/snpeff-5.3.0a-0/snpEff.jar"
-SNPEFF_DB="Pf3D7_v2"
-SNPEFF_CONFIG="/mnt/hpc_acegid/nfsscratch/DATABASE/snpeff/snpEff.config"
-
-# Resources
-THREADS=16
-SAMPLE_WORKERS=4
-
-# Pipeline script
-SCRIPT="scripts/pf_hrp2_hrp3_pipeline.py"
-
-############################################
-# TERMINAL COLORS
-############################################
 
 GREEN="\033[32m"
 RED="\033[31m"
@@ -62,39 +20,105 @@ warn() { echo -e "${YELLOW}[WARN]${RESET} $1"; }
 fail() { echo -e "${RED}[FAIL]${RESET} $1"; }
 
 ############################################
-# FUNCTIONS
+# USER CONFIGURATION
 ############################################
 
-#--------------------------------------------------
-# Check required inputs before running pipeline
-#--------------------------------------------------
-check_inputs() {
-    log "Checking input files and directories..."
+# Choose: illumina or nanopore
+PLATFORM="${1:-illumina}"
 
-    [ -d "$INPUT_DIR" ] || { fail "Missing INPUT_DIR"; exit 1; }
-    [ -f "$PF_REF" ] || { fail "Missing PF_REF"; exit 1; }
-    [ -f "$GENES_BED" ] || { fail "Missing GENES_BED"; exit 1; }
-    [ -f "$SNPEFF_JAR" ] || { fail "Missing SNPEFF_JAR"; exit 1; }
-    [ -f "$SNPEFF_CONFIG" ] || { fail "Missing SNPEFF_CONFIG"; exit 1; }
+# Common references
+PF_REF="/mnt/hpc_acegid/home/khadmig/work/ref_3d7/Pf3D7_v2.fasta"
+GENES_BED="assets/hrp2_hrp3_genes.bed"
 
-    if [ ! -f "$HUMAN_REF" ]; then
-        warn "HUMAN_REF not found → host decontamination will FAIL"
-    fi
+# snpEff
+SNPEFF_JAR="/mnt/hpc_acegid/home/khadmig/miniconda/envs/pf_ont_pipeline/share/snpeff-5.3.0a-0/snpEff.jar"
+SNPEFF_DB="Pf3D7_v2"
+SNPEFF_CONFIG="/mnt/hpc_acegid/nfsscratch/DATABASE/snpeff/snpEff.config"
 
-    mkdir -p "$OUTPUT_DIR"
+# Resources
+THREADS=16
+SAMPLE_WORKERS=4
 
-    ok "All inputs validated"
+############################################
+# ILLUMINA CONFIGURATION
+############################################
+
+ILLUMINA_INPUT_DIR="/mnt/hpc_acegid/home/khadmig/work/data/malaria/ILLUMINA_DATA/260420_VH00635_5_AAHL3MNM5/fastq"
+ILLUMINA_OUTPUT_DIR="/mnt/hpc_acegid/home/khadmig/work/data/malaria/ILLUMINA_DATA/260420_VH00635_5_AAHL3MNM5/results"
+HUMAN_REF="/mnt/hpc_acegid/nfsscratch/DATABASE/hg38/hg38.fa"
+ILLUMINA_SCRIPT="scripts/pf_hrp2_hrp3_pipeline_illumina.py"
+
+############################################
+# NANOPORE CONFIGURATION
+############################################
+
+NANOPORE_DEMUX_DIR="/mnt/hpc_acegid/home/khadmig/work/data/malaria/NANOPORE_DATA/demux"
+NANOPORE_OUTPUT_DIR="/mnt/hpc_acegid/home/khadmig/work/data/malaria/NANOPORE_DATA/results"
+NANOPORE_METADATA="metadata/nanopore_metadata.tsv"
+NANOPORE_SCRIPT="scripts/pf_hrp2_hrp3_pipeline_nanopore.py"
+
+CLAIR3_MODEL_PATH="/mnt/hpc_acegid/nfsscratch/DATABASE/clair3_models/ont"
+CLAIR3_PLATFORM="ont"
+
+# Optional DEploid2
+RUN_DEPLOID=0
+POPULATION_VCF=""
+GENETIC_MAP=""
+EXCLUDE_VCF=""
+
+############################################
+# INPUT VALIDATION
+############################################
+
+check_common_inputs() {
+    [ -f "$PF_REF" ] || { fail "Missing PF_REF: $PF_REF"; exit 1; }
+    [ -f "$GENES_BED" ] || { fail "Missing GENES_BED: $GENES_BED"; exit 1; }
+    [ -f "$SNPEFF_JAR" ] || { fail "Missing SNPEFF_JAR: $SNPEFF_JAR"; exit 1; }
+    [ -f "$SNPEFF_CONFIG" ] || { fail "Missing SNPEFF_CONFIG: $SNPEFF_CONFIG"; exit 1; }
 }
 
-#--------------------------------------------------
-# Run full pipeline
-#--------------------------------------------------
-run_pipeline() {
-    log "Launching HRP2/HRP3 pipeline..."
+check_illumina_inputs() {
+    log "Checking Illumina inputs..."
+    check_common_inputs
+    [ -d "$ILLUMINA_INPUT_DIR" ] || { fail "Missing ILLUMINA_INPUT_DIR: $ILLUMINA_INPUT_DIR"; exit 1; }
+    [ -f "$HUMAN_REF" ] || { fail "Missing HUMAN_REF: $HUMAN_REF"; exit 1; }
+    [ -f "$ILLUMINA_SCRIPT" ] || { fail "Missing Illumina script: $ILLUMINA_SCRIPT"; exit 1; }
+    mkdir -p "$ILLUMINA_OUTPUT_DIR"
+    ok "Illumina inputs validated"
+}
 
-    python3 "$SCRIPT" \
-      --input_dir "$INPUT_DIR" \
-      --output_dir "$OUTPUT_DIR" \
+check_nanopore_inputs() {
+    log "Checking Nanopore inputs..."
+    check_common_inputs
+    [ -d "$NANOPORE_DEMUX_DIR" ] || { fail "Missing NANOPORE_DEMUX_DIR: $NANOPORE_DEMUX_DIR"; exit 1; }
+    [ -f "$NANOPORE_SCRIPT" ] || { fail "Missing Nanopore script: $NANOPORE_SCRIPT"; exit 1; }
+
+    if [ -n "$NANOPORE_METADATA" ] && [ ! -f "$NANOPORE_METADATA" ]; then
+        warn "NANOPORE_METADATA not found; barcode names will be used as sample names"
+        NANOPORE_METADATA=""
+    fi
+
+    if [ ! -d "$CLAIR3_MODEL_PATH" ]; then
+        fail "Missing CLAIR3_MODEL_PATH: $CLAIR3_MODEL_PATH"
+        exit 1
+    fi
+
+    mkdir -p "$NANOPORE_OUTPUT_DIR"
+    ok "Nanopore inputs validated"
+}
+
+############################################
+# PIPELINE RUNNERS
+############################################
+
+run_illumina() {
+    check_illumina_inputs
+
+    log "Launching Illumina HRP2/HRP3 pipeline..."
+
+    python3 "$ILLUMINA_SCRIPT" \
+      --input_dir "$ILLUMINA_INPUT_DIR" \
+      --output_dir "$ILLUMINA_OUTPUT_DIR" \
       --pf_ref "$PF_REF" \
       --human_ref "$HUMAN_REF" \
       --genes_bed "$GENES_BED" \
@@ -104,23 +128,85 @@ run_pipeline() {
       --threads "$THREADS" \
       --sample_workers "$SAMPLE_WORKERS"
 
-    ok "Pipeline execution completed"
+    ok "Illumina pipeline completed"
+}
+
+run_nanopore() {
+    check_nanopore_inputs
+
+    log "Launching Nanopore HRP2/HRP3 pipeline..."
+
+    CMD=(
+      python3 "$NANOPORE_SCRIPT"
+      --demux_dir "$NANOPORE_DEMUX_DIR"
+      --output_dir "$NANOPORE_OUTPUT_DIR"
+      --reference "$PF_REF"
+      --genes_bed "$GENES_BED"
+      --snpeff "$SNPEFF_JAR"
+      --snpeff_db "$SNPEFF_DB"
+      --snpeff_config "$SNPEFF_CONFIG"
+      --threads "$THREADS"
+      --sample_workers "$SAMPLE_WORKERS"
+      --run_clair3 1
+      --run_freebayes 1
+      --run_bcftools 1
+      --clair3_model_path "$CLAIR3_MODEL_PATH"
+      --clair3_platform "$CLAIR3_PLATFORM"
+    )
+
+    if [ -n "$NANOPORE_METADATA" ]; then
+        CMD+=(--metadata "$NANOPORE_METADATA")
+    fi
+
+    if [ "$RUN_DEPLOID" -eq 1 ]; then
+        CMD+=(--run_deploid)
+
+        if [ -n "$POPULATION_VCF" ]; then
+            CMD+=(--population_vcf "$POPULATION_VCF")
+        fi
+
+        if [ -n "$GENETIC_MAP" ]; then
+            CMD+=(--genetic_map "$GENETIC_MAP")
+        fi
+
+        if [ -n "$EXCLUDE_VCF" ]; then
+            CMD+=(--exclude_vcf "$EXCLUDE_VCF")
+        fi
+    fi
+
+    "${CMD[@]}"
+
+    ok "Nanopore pipeline completed"
 }
 
 ############################################
-# MAIN EXECUTION
+# MAIN
 ############################################
 
 main() {
     echo -e "${BLUE}====================================================${RESET}"
-    echo -e "${BLUE}  PF HRP2/HRP3 Deletion Pipeline - Illumina${RESET}"
+    echo -e "${BLUE}  PF HRP2/HRP3 Deletion Pipeline${RESET}"
+    echo -e "${BLUE}  Platform: ${PLATFORM}${RESET}"
     echo -e "${BLUE}====================================================${RESET}"
 
-    check_inputs
-    run_pipeline
+    case "$PLATFORM" in
+        illumina|ILLUMINA)
+            run_illumina
+            ;;
+        nanopore|NANOPORE|ont|ONT)
+            run_nanopore
+            ;;
+        *)
+            fail "Unknown platform: $PLATFORM"
+            echo "Usage:"
+            echo "  bash main.sh illumina"
+            echo "  bash main.sh nanopore"
+            exit 1
+            ;;
+    esac
 
     echo -e "${GREEN}====================================================${RESET}"
-    echo -e "${GREEN}  ALL DONE ${RESET}"
+    echo -e "${GREEN}  ALL DONE${RESET}"
     echo -e "${GREEN}====================================================${RESET}"
 }
 
