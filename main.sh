@@ -54,10 +54,10 @@ ILLUMINA_SCRIPT="scripts/pf_hrp2_hrp3_pipeline_illumina.py"
 
 NANOPORE_DEMUX_DIR="/mnt/hpc_acegid/home/khadmig/work/data/malaria/NANOPORE_DATA/demux"
 NANOPORE_OUTPUT_DIR="/mnt/hpc_acegid/home/khadmig/work/data/malaria/NANOPORE_DATA/results"
-NANOPORE_METADATA="metadata/nanopore_metadata.tsv"
+NANOPORE_METADATA="/mnt/hpc_acegid/nfsscratch/khadmig/data/malaria/demux_input/metadata_with_sample.tsv"
 NANOPORE_SCRIPT="scripts/pf_hrp2_hrp3_pipeline_nanopore.py"
 
-CLAIR3_MODEL_PATH="/mnt/hpc_acegid/nfsscratch/DATABASE/clair3_models/ont"
+CLAIR3_MODEL_PATH="$HOME/miniconda/envs/pf_ont_pipeline/bin/models/ont_guppy5"
 CLAIR3_PLATFORM="ont"
 
 # Optional DEploid2
